@@ -5,13 +5,17 @@ import EventType from '../events/EventType.js';
 import ImageTile from '../ImageTile.js';
 import ReprojTile from '../reproj/Tile.js';
 import TileCache from '../TileCache.js';
+import TileQueue from '../TileQueue.js';
 import TileState from '../TileState.js';
 import UrlTile from './UrlTile.js';
 import {ENABLE_RASTER_REPROJECTION} from '../reproj/common.js';
+import {VOID} from '../functions.js';
 import {equivalent, get as getProjection} from '../proj.js';
 import {getKey, getKeyZXY} from '../tilecoord.js';
 import {getForProjection as getTileGridForProjection} from '../tilegrid.js';
 import {getUid} from '../util.js';
+import {listen, unlistenByKey} from '../events.js';
+import {toSize} from '../size.js';
 
 /**
  * @typedef {Object} Options
@@ -56,6 +60,13 @@ import {getUid} from '../util.js';
  * @property {number|import("../array.js").NearestDirectionFunction} [zDirection=0]
  * Choose whether to use tiles with a higher or lower zoom level when between integer
  * zoom levels. See {@link module:ol/tilegrid/TileGrid~TileGrid#getZForResolution}.
+ */
+
+/**
+ * @typedef {Object} GetTileImageOptions
+ * @property {number} [pixelRatio=1] Pixel ratio.
+ * @property {import("../proj.js").ProjectionLike} [projection] Projection.
+ * Defaults to the source projection if available, otherwise EPSG:3857.
  */
 
 /**
@@ -130,6 +141,13 @@ class TileImage extends UrlTile {
      * @type {boolean}
      */
     this.renderReprojectionEdges_ = false;
+
+    /**
+     * Queue for getTileImage()
+     * @private
+     * @type {import("../TileQueue.js").default}
+     */
+    this.tileQueue_;
   }
 
   /**
@@ -450,6 +468,105 @@ class TileImage extends UrlTile {
         }
       }
     }
+  }
+
+  /**
+   * Utility method to obtain the image for a single tile, loading and reprojecting if necessary.
+   *
+   * @param {import("../tilecoord.js").TileCoord} tileCoord Tile Coordinate.
+   * @param {GetTileImageOptions} [opt_options] Options.
+   * @return {Promise<HTMLCanvasElement|HTMLImageElement|HTMLVideoElement|undefined>} Image.
+   * @api
+   */
+  getTileImage(tileCoord, opt_options) {
+    const options = opt_options || {};
+    const pixelRatio = options.pixelRatio || 1;
+    const projection =
+      getProjection(options.projection) ||
+      this.getProjection() ||
+      getProjection('EPSG:3857');
+    const self = this;
+
+    if (!self.tileQueue_) {
+      self.tileQueue_ = new TileQueue(function () {
+        return 1;
+      }, VOID);
+    }
+
+    return new Promise(function (resolve, reject) {
+      let sourceState = self.getState();
+
+      const resolveEmpty = function () {
+        const tileSize = toSize(
+          self.getTileGridForProjection(projection).getTileSize(tileCoord[0])
+        );
+        const tilePixelRatio = self.getTilePixelRatio(pixelRatio);
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.round(tileSize[0] * tilePixelRatio);
+        canvas.height = Math.round(tileSize[1] * tilePixelRatio);
+        resolve(canvas);
+      };
+
+      const readTile = function () {
+        if (sourceState === 'ready') {
+          const tile = self.getTile(
+            tileCoord[0],
+            tileCoord[1],
+            tileCoord[2],
+            pixelRatio,
+            projection
+          );
+          if (tile) {
+            const maxQueue = 16;
+            const tileState = tile.getState();
+            if (tileState === TileState.EMPTY) {
+              resolveEmpty();
+            } else if (tileState === TileState.LOADED) {
+              resolve(tile.getImage());
+            } else {
+              const key = listen(tile, EventType.CHANGE, function () {
+                const tileState = tile.getState();
+                if (tileState !== TileState.LOADING) {
+                  unlistenByKey(key);
+                  self.tileQueue_.loadMoreTiles(maxQueue, maxQueue);
+                  if (tileState === TileState.EMPTY) {
+                    resolveEmpty();
+                  } else {
+                    resolve(
+                      tileState === TileState.LOADED
+                        ? tile.getImage()
+                        : undefined
+                    );
+                  }
+                }
+              });
+              if (tileState === TileState.ERROR) {
+                tile.state = TileState.IDLE;
+              }
+              const tileQueueKey = tile.getKey();
+              if (!self.tileQueue_.isKeyQueued(tileQueueKey)) {
+                self.tileQueue_.enqueue([tile]);
+                self.tileQueue_.loadMoreTiles(maxQueue, maxQueue);
+              }
+            }
+            return;
+          }
+        }
+        resolve(undefined);
+      };
+
+      if (sourceState !== 'loading') {
+        readTile();
+      } else {
+        const key = listen(self, EventType.CHANGE, function () {
+          sourceState = self.getState();
+          if (sourceState !== 'loading') {
+            unlistenByKey(key);
+            readTile();
+          }
+        });
+      }
+    });
   }
 }
 
