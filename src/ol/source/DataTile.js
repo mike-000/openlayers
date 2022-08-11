@@ -3,13 +3,25 @@
  */
 import DataTile from '../DataTile.js';
 import EventType from '../events/EventType.js';
+import ImageTile from '../ImageTile.js';
+import TileCache from '../TileCache.js';
 import TileEventType from './TileEventType.js';
+import TileImage from './TileImage.js';
+import TileQueue from '../TileQueue.js';
 import TileSource, {TileSourceEvent} from './Tile.js';
 import TileState from '../TileState.js';
-import {createXYZ, extentFromProjection} from '../tilegrid.js';
+import {ENABLE_RASTER_REPROJECTION} from '../reproj/common.js';
+import {VOID, toPromise} from '../functions.js';
+import {createCanvasContext2D, releaseCanvas} from '../dom.js';
+import {
+  createXYZ,
+  extentFromProjection,
+  getForProjection as getTileGridForProjection,
+} from '../tilegrid.js';
+import {equivalent, get as getProjection} from '../proj.js';
 import {getKeyZXY} from '../tilecoord.js';
 import {getUid} from '../util.js';
-import {toPromise} from '../functions.js';
+import {listen, unlistenByKey} from '../events.js';
 import {toSize} from '../size.js';
 
 /**
@@ -42,6 +54,13 @@ import {toSize} from '../size.js';
  * @property {boolean} [interpolate=false] Use interpolated values when resampling.  By default,
  * the nearest neighbor is used when resampling.
  */
+
+/**
+ * @typedef {Object} GetTileDataOptions
+ * @property {number} [pixelRatio=1] Pixel ratio.
+ */
+
+const ENABLE_DATA_REPROJECTION = true;
 
 /**
  * @classdesc
@@ -117,6 +136,61 @@ class DataTileSource extends TileSource {
      * @type {number}
      */
     this.bandCount = options.bandCount === undefined ? 4 : options.bandCount; // assume RGBA if undefined
+
+    /**
+     * @protected
+     * @type {!Object<string, import("../tilegrid/TileGrid.js").default>}
+     */
+    this.tileGridForProjection = {};
+
+    /**
+     * @protected
+     * @type {!Object<string, import("../TileCache.js").default>}
+     */
+    this.tileCacheForProjection = {};
+
+    /**
+     * Queue for getTileData()
+     * @private
+     * @type {import("../TileQueue.js").default}
+     */
+    this.tileQueue_;
+
+    /**
+     * @private
+     * @type {typeof Float32Array|typeof Uint8Array}
+     */
+    this.dataType_;
+
+    /**
+     * @private
+     * @type {number}
+     */
+    this.bytesPerPixel_;
+
+    /**
+     * @private
+     * @type {!Array<import("./TileImage.js").default>}
+     */
+    this.reprojImageSources_;
+
+    /**
+     * @private
+     * @type {!Object<string, DataTileSource>}
+     */
+    this.reprojDataSources_;
+
+    /**
+     * @private
+     * @type {!Array<HTMLCanvasElement>}
+     */
+    this.canvasPool_;
+
+    /**
+     * @private
+     * @type {number}
+     */
+    this.reprojDataPending_ = 0;
   }
 
   /**
@@ -152,7 +226,12 @@ class DataTileSource extends TileSource {
    * @return {number} Gutter.
    */
   getGutterForProjection(projection) {
-    return this.gutter_;
+    const thisProj = this.getProjection();
+    if (!thisProj || equivalent(thisProj, projection)) {
+      return this.gutter_;
+    } else {
+      return 0;
+    }
   }
 
   /**
@@ -172,6 +251,70 @@ class DataTileSource extends TileSource {
    * @return {!DataTile} Tile.
    */
   getTile(z, x, y, pixelRatio, projection) {
+    const thisProj = this.getProjection();
+    if (
+      ENABLE_DATA_REPROJECTION &&
+      ENABLE_RASTER_REPROJECTION &&
+      thisProj &&
+      projection &&
+      !equivalent(thisProj, projection)
+    ) {
+      const tileCoordKey = getKeyZXY(z, x, y);
+      const tileCache = this.getTileCacheForProjection(projection);
+      if (tileCache.containsKey(tileCoordKey)) {
+        return tileCache.get(tileCoordKey);
+      }
+
+      const self = this;
+      const loader = function () {
+        self.reprojDataPending_++;
+        return self
+          .getReprojTileData_([z, x, y], pixelRatio, projection)
+          .then(function (data) {
+            if (!data) {
+              return Promise.reject();
+            }
+            self.reprojDataPending_--;
+            return data;
+          })
+          .catch(function (error) {
+            self.reprojDataPending_--;
+            throw error;
+          });
+      };
+
+      const tileGrid = self.getTileGrid();
+      const tilePixelRatio = Math.max.apply(
+        null,
+        tileGrid.getResolutions().map(function (r, z) {
+          const tileSize = toSize(tileGrid.getTileSize(z));
+          const textureSize = self.getTileSize(z);
+          return Math.max(
+            textureSize[0] / tileSize[0],
+            textureSize[1] / tileSize[1]
+          );
+        })
+      );
+      const reprojTileGrid = self.getTileGridForProjection(projection);
+      const tileSize = toSize(reprojTileGrid.getTileSize(z));
+      const size = [
+        Math.round(tileSize[0] * tilePixelRatio),
+        Math.round(tileSize[1] * tilePixelRatio),
+      ];
+
+      const tile = new DataTile(
+        Object.assign(
+          {tileCoord: [z, x, y], loader: loader, size: size},
+          this.tileOptions
+        )
+      );
+      tile.key = this.getKey();
+      tile.addEventListener(EventType.CHANGE, this.handleTileChange_);
+
+      tileCache.set(tileCoordKey, tile);
+      return tile;
+    }
+
     const size = this.getTileSize(z);
     const tileCoordKey = getKeyZXY(z, x, y);
     if (this.tileCache.containsKey(tileCoordKey)) {
@@ -227,6 +370,405 @@ class DataTileSource extends TileSource {
     if (type) {
       this.dispatchEvent(new TileSourceEvent(type, tile));
     }
+  }
+
+  /**
+   * Utility method to obtain the data for a single tile, loading if necessary.
+   *
+   * @param {import("../tilecoord.js").TileCoord} tileCoord Tile Coordinate.
+   * @param {GetTileDataOptions} [opt_options] Options.
+   * @return {Promise<import("../DataTile.js").Data|undefined>} Data.
+   */
+  getTileData(tileCoord, opt_options) {
+    const options = opt_options || {};
+    const pixelRatio = options.pixelRatio || 1;
+    const self = this;
+
+    if (!self.tileQueue_) {
+      self.tileQueue_ = new TileQueue(function () {
+        return 1;
+      }, VOID);
+    }
+
+    return new Promise(function (resolve, reject) {
+      let sourceState = self.getState();
+
+      const readTile = function () {
+        if (sourceState === 'ready') {
+          const projection = self.getProjection();
+          const tile = self.getTile(
+            tileCoord[0],
+            tileCoord[1],
+            tileCoord[2],
+            pixelRatio,
+            projection
+          );
+          if (tile) {
+            const maxQueue = 8;
+            const tileState = tile.getState();
+            if (tileState === TileState.LOADED) {
+              resolve(tile.getData());
+            } else if (tileState === TileState.EMPTY) {
+              resolve(undefined);
+            } else {
+              const key = listen(tile, EventType.CHANGE, function () {
+                const tileState = tile.getState();
+                if (tileState !== TileState.LOADING) {
+                  unlistenByKey(key);
+                  self.tileQueue_.loadMoreTiles(maxQueue, maxQueue);
+                  resolve(
+                    tileState === TileState.LOADED ? tile.getData() : undefined
+                  );
+                }
+              });
+              if (tileState === TileState.ERROR) {
+                tile.state = TileState.IDLE;
+              }
+              const tileQueueKey = tile.getKey();
+              if (!self.tileQueue_.isKeyQueued(tileQueueKey)) {
+                self.tileQueue_.enqueue([tile]);
+                self.tileQueue_.loadMoreTiles(maxQueue, maxQueue);
+              }
+            }
+            return;
+          }
+        }
+        resolve(undefined);
+      };
+
+      if (sourceState !== 'loading') {
+        readTile();
+      } else {
+        const key = listen(self, EventType.CHANGE, function () {
+          sourceState = self.getState();
+          if (sourceState !== 'loading') {
+            unlistenByKey(key);
+            readTile();
+          }
+        });
+      }
+    });
+  }
+
+  /**
+   * @param {import("../proj/Projection.js").default} projection Projection.
+   * @return {!import("../tilegrid/TileGrid.js").default} Tile grid.
+   */
+  getTileGridForProjection(projection) {
+    if (!ENABLE_DATA_REPROJECTION || !ENABLE_RASTER_REPROJECTION) {
+      return super.getTileGridForProjection(projection);
+    }
+    const thisProj = this.getProjection();
+    if (this.tileGrid && (!thisProj || equivalent(thisProj, projection))) {
+      return this.tileGrid;
+    } else {
+      const projKey = getUid(projection);
+      if (!(projKey in this.tileGridForProjection)) {
+        this.tileGridForProjection[projKey] =
+          getTileGridForProjection(projection);
+      }
+      return this.tileGridForProjection[projKey];
+    }
+  }
+
+  /**
+   * Sets the tile grid to use when reprojecting the tiles to the given
+   * projection instead of the default tile grid for the projection.
+   *
+   * This can be useful when the default tile grid cannot be created
+   * (e.g. projection has no extent defined) or
+   * for optimization reasons (custom tile size, resolutions, ...).
+   *
+   * @param {import("../proj.js").ProjectionLike} projection Projection.
+   * @param {import("../tilegrid/TileGrid.js").default} tilegrid Tile grid to use for the projection.
+   * @api
+   */
+  setTileGridForProjection(projection, tilegrid) {
+    if (ENABLE_DATA_REPROJECTION && ENABLE_RASTER_REPROJECTION) {
+      const proj = getProjection(projection);
+      if (proj) {
+        const projKey = getUid(proj);
+        if (!(projKey in this.tileGridForProjection)) {
+          this.tileGridForProjection[projKey] = tilegrid;
+        }
+      }
+    }
+  }
+
+  /**
+   * @param {import("../proj/Projection.js").default} projection Projection.
+   * @return {import("../TileCache.js").default} Tile cache.
+   */
+  getTileCacheForProjection(projection) {
+    if (!ENABLE_DATA_REPROJECTION || !ENABLE_RASTER_REPROJECTION) {
+      return super.getTileCacheForProjection(projection);
+    }
+    const thisProj = this.getProjection();
+    if (!thisProj || equivalent(thisProj, projection)) {
+      return this.tileCache;
+    } else {
+      const projKey = getUid(projection);
+      if (!(projKey in this.tileCacheForProjection)) {
+        this.tileCacheForProjection[projKey] = new TileCache(0.1); // don't cache
+      }
+      return this.tileCacheForProjection[projKey];
+    }
+  }
+
+  /**
+   * @param {import("../proj/Projection.js").default} projection Projection.
+   * @param {!Object<string, boolean>} usedTiles Used tiles.
+   */
+  expireCache(projection, usedTiles) {
+    if (!ENABLE_DATA_REPROJECTION || !ENABLE_RASTER_REPROJECTION) {
+      super.expireCache(projection, usedTiles);
+      return;
+    }
+    const usedTileCache = this.getTileCacheForProjection(projection);
+
+    this.tileCache.expireCache(
+      this.tileCache == usedTileCache ? usedTiles : {}
+    );
+    for (const id in this.tileCacheForProjection) {
+      const tileCache = this.tileCacheForProjection[id];
+      tileCache.expireCache(tileCache == usedTileCache ? usedTiles : {});
+    }
+    if (this.reprojDataSources_ && this.reprojDataPending_ == 0) {
+      for (let i = 0, ii = this.reprojImageSources_.length; i < ii; ++i) {
+        this.reprojImageSources_[i].expireCache(projection, {});
+      }
+      for (const id in this.reprojDataSources_) {
+        this.reprojDataSources_[id].expireCache(projection, {});
+      }
+    }
+  }
+
+  /**
+   * @param {import("../tilecoord.js").TileCoord} tileCoord Tile Coordinate.
+   * @param {number} pixelRatio Pixel ratio.
+   * @param {import("../proj/Projection.js").default} viewProjection View projection.
+   * @return {Promise<import("../DataTile.js").Data|undefined>} Data.
+   * @private
+   */
+  getReprojTileData_(tileCoord, pixelRatio, viewProjection) {
+    const self = this;
+
+    /**
+     * @param {import("./TileImage.js").Options} options TileImage options.
+     * @param {number} gutter Gutter.
+     */
+    class sourceClass extends TileImage {
+      constructor(options, gutter) {
+        super(options);
+
+        /**
+         * @private
+         * @type {number}
+         */
+        this.gutter_ = gutter;
+      }
+
+      /**
+       * @return {number} Gutter.
+       */
+      getGutter() {
+        return this.gutter_;
+      }
+    }
+
+    class tileClass extends ImageTile {
+      release() {
+        const canvas = this.getImage();
+        if (canvas instanceof HTMLCanvasElement) {
+          releaseCanvas(canvas.getContext('2d'));
+          self.canvasPool_.push(canvas);
+        }
+        super.release();
+      }
+    }
+
+    const getImageTiles = function (tileCoord, index) {
+      return self
+        .getTileData(tileCoord, {pixelRatio: pixelRatio})
+        .then(function (tileData) {
+          if (tileData) {
+            const size = self.getTileSize(tileCoord[0]);
+            const gutter = self.getGutterForProjection(self.getProjection());
+            const pixelSize = [size[0] + 2 * gutter, size[1] + 2 * gutter];
+            const isFloat = tileData instanceof Float32Array;
+            const pixelCount = pixelSize[0] * pixelSize[1];
+            const DataType = isFloat ? Float32Array : Uint8Array;
+            const tileDataR = new DataType(tileData.buffer);
+            const bytesPerElement = DataType.BYTES_PER_ELEMENT;
+            const bytesPerPixel =
+              (bytesPerElement * tileDataR.length) / pixelCount;
+            const bytesPerRow = tileDataR.byteLength / pixelSize[1];
+            const bandCount = Math.floor(
+              bytesPerRow / bytesPerElement / pixelSize[0]
+            );
+            const packedLength = pixelCount * bandCount;
+            let packedData = tileDataR;
+            if (tileDataR.length !== packedLength) {
+              packedData = new DataType(packedLength);
+              let dataIndex = 0;
+              let rowOffset = 0;
+              const colCount = pixelSize[0] * bandCount;
+              for (let rowIndex = 0; rowIndex < pixelSize[1]; ++rowIndex) {
+                for (let colIndex = 0; colIndex < colCount; ++colIndex) {
+                  packedData[dataIndex++] = tileDataR[rowOffset + colIndex];
+                }
+                rowOffset += bytesPerRow / bytesPerElement;
+              }
+            }
+            const buffer = new Uint8Array(packedData.buffer);
+            const width = pixelSize[0];
+            const height = pixelSize[1];
+            const context = createCanvasContext2D(
+              width,
+              height,
+              self.canvasPool_
+            );
+            const imageData = context.getImageData(0, 0, width, height);
+            const data = imageData.data;
+            let offset = index * 3;
+            for (let j = 0, len = data.length; j < len; j += 4) {
+              data[j] = buffer[offset];
+              data[j + 1] = buffer[offset + 1];
+              data[j + 2] = buffer[offset + 2];
+              data[j + 3] = 255;
+              offset += bytesPerPixel;
+            }
+            context.putImageData(imageData, 0, 0);
+
+            self.dataType_ = DataType;
+            self.bytesPerPixel_ = bytesPerPixel;
+            return context.canvas;
+          }
+        });
+    };
+
+    function createReprojSource(index) {
+      const projection = self.getProjection();
+      const tileGrid = self.getTileGrid();
+      const tilePixelRatio = Math.max.apply(
+        null,
+        tileGrid.getResolutions().map(function (r, z) {
+          const tileSize = toSize(tileGrid.getTileSize(z));
+          const textureSize = self.getTileSize(z);
+          return Math.max(
+            textureSize[0] / tileSize[0],
+            textureSize[1] / tileSize[1]
+          );
+        })
+      );
+      const reprojSource = new sourceClass(
+        {
+          projection: projection,
+          tileGrid: tileGrid,
+          tilePixelRatio: tilePixelRatio,
+          url: '{z}/{x}/{y}:' + index,
+          cacheSize: 0.1, // don't cache
+          tileLoadFunction: function (tile) {
+            getImageTiles(tile.getTileCoord(), index).then(function (canvas) {
+              if (canvas) {
+                /** @type {import("../ImageTile.js").default} */ (
+                  tile
+                ).setImage(canvas);
+              } else {
+                tile.setState(TileState.ERROR);
+              }
+            });
+          },
+          interpolate: false,
+          tileClass: tileClass,
+        },
+        self.getGutterForProjection(projection)
+      );
+      reprojSource.setTileGridForProjection(
+        viewProjection,
+        self.getTileGridForProjection(viewProjection)
+      );
+      return reprojSource;
+    }
+
+    if (!self.reprojDataSources_) {
+      self.tileCache = new TileCache(0); // cache tiles before reprojection
+      self.reprojImageSources_ = [];
+      self.reprojDataSources_ = {};
+      self.canvasPool_ = [];
+    }
+    const projKey = getUid(viewProjection);
+    if (!(projKey in self.reprojDataSources_)) {
+      self.reprojDataSources_[projKey] = new DataTileSource({
+        projection: viewProjection,
+        interpolate: self.getInterpolate(),
+        tileGrid: self.getTileGridForProjection(viewProjection),
+        wrapX: self.getWrapX(),
+        loader: function (z, x, y) {
+          const canvasData = [];
+
+          function handleTile(index) {
+            if (index === self.reprojImageSources_.length) {
+              self.reprojImageSources_.push(createReprojSource(index));
+            }
+            return self.reprojImageSources_[index]
+              .getTileImage([z, x, y], {
+                projection: viewProjection,
+              })
+              .then(function (canvas) {
+                if (!canvas) {
+                  return Promise.reject();
+                }
+                const context = /** @type {HTMLCanvasElement} */ (
+                  canvas
+                ).getContext('2d');
+                canvasData.push(
+                  context.getImageData(0, 0, canvas.width, canvas.height)
+                );
+                releaseCanvas(context);
+
+                const tilesNeeded = Math.ceil(self.bytesPerPixel_ / 3);
+                if (index < tilesNeeded - 1) {
+                  return handleTile(index + 1);
+                }
+
+                let dataR, dataU;
+
+                for (let tile = tilesNeeded - 1; tile >= 0; --tile) {
+                  const imageData = canvasData[tile];
+                  if (!dataR) {
+                    dataU = new Uint8Array(
+                      self.bytesPerPixel_ * imageData.width * imageData.height
+                    );
+                    dataR = new self.dataType_(dataU.buffer);
+                  }
+                  const data = imageData.data;
+                  let offset = tile * 3;
+                  for (let i = 0, len = data.length; i < len; i += 4) {
+                    dataU[offset] = data[i];
+                    dataU[offset + 1] = data[i + 1];
+                    dataU[offset + 2] = data[i + 2];
+                    offset += self.bytesPerPixel_;
+                  }
+                }
+
+                if (!dataR) {
+                  return Promise.reject();
+                }
+                return dataR;
+              });
+          }
+          return handleTile(0);
+        },
+      });
+    }
+
+    const source = self.reprojDataSources_[projKey];
+    const wrappedTileCoord = source.getTileCoordForTileUrlFunction(
+      tileCoord,
+      viewProjection
+    );
+    return source.getTileData(wrappedTileCoord, {pixelRatio: pixelRatio});
   }
 }
 
